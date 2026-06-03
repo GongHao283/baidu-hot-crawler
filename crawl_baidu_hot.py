@@ -168,20 +168,3 @@ class BaiduHotCrawler:
         """
         return self.db.executemany(sql, valid)
 
-if __name__ == "__main__":
-    # 创建数据库连接对象
-    from mysql_helper import MySQLHelper   # 确保 mysql_helper.py 在同一目录
-
-    db = MySQLHelper(
-        host='localhost',
-        port=3306,
-        user='root',
-        password='gh000910',
-        database='crawler_data'
-    )
-
-    # 创建爬虫实例
-    crawler = BaiduHotCrawler(db, request_delay=1.0)
-
-    # 运行爬虫（保存前10条）
-    crawler.run()
