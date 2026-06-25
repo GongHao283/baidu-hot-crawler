@@ -1,179 +1,115 @@
-# douban_crawler.py
-import time
-import requests
-from lxml import html
-from typing import List, Dict, Any
-from mysql_helper import MySQLHelper
+# mysql_helper.py
+import pymysql
+from dbutils.pooled_db import PooledDB
+from typing import List, Dict, Any, Optional
 
-class DoubanMovieCrawler:
-    """Douban Movie Top 250 Crawler (supports custom save count, default 100)"""
-
-    TABLE_NAME = "douban_movie_top100"
-    TABLE_COLUMNS = """
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        `rank` INT NOT NULL,
-        title VARCHAR(255) NOT NULL,
-        rating VARCHAR(10),
-        rating_num VARCHAR(20),
-        year VARCHAR(20),
-        url VARCHAR(500),
-        crawl_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+class MySQLHelper:
+    """
+    Generic MySQL operation wrapper using DBUtils connection pool.
     """
 
-    def __init__(self, db_helper: MySQLHelper, request_delay: float = 2.0):
-        """
-        :param db_helper: MySQLHelper instance
-        :param request_delay: Delay between requests (seconds), Douban anti-scraping is strict, recommend >=2
-        """
-        self.db = db_helper
-        self.delay = request_delay
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Referer': 'https://movie.douban.com/',
-        }
-        self._init_table()
+    def __init__(self, host: str, port: int, user: str, password: str, database: str, charset: str = 'utf8mb4'):
+        self.pool = PooledDB(
+            creator=pymysql,
+            maxconnections=5,
+            mincached=2,
+            maxcached=3,
+            blocking=True,
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            charset=charset,
+            cursorclass=pymysql.cursors.DictCursor
+        )
 
-    def _init_table(self):
-        """Create table if it does not exist."""
-        self.db.create_table(self.TABLE_NAME, self.TABLE_COLUMNS, if_not_exists=True)
-        # Optionally add index for crawl_time
+    def get_connection(self):
+        return self.pool.connection()
+
+    def execute(self, sql: str, params: Optional[tuple] = None) -> int:
+        """Execute INSERT/UPDATE/DELETE and return the number of affected rows."""
+        conn = self.get_connection()
         try:
-            self.db.execute(f"CREATE INDEX IF NOT EXISTS idx_crawl_time ON {self.TABLE_NAME} (crawl_time)")
-        except Exception:
-            pass
+            with conn.cursor() as cursor:
+                affected = cursor.execute(sql, params)
+                conn.commit()
+                return affected
+        finally:
+            conn.close()
 
-    def fetch_page(self, url: str) -> str:
-        """Request a single page, return HTML text (with delay)"""
-        time.sleep(self.delay)
+    def executemany(self, sql: str, params_list: List[tuple]) -> int:
+        """Execute batch operations and return the number of affected rows."""
+        conn = self.get_connection()
         try:
-            resp = requests.get(url, headers=self.headers, timeout=10)
-            resp.encoding = 'utf-8'
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as e:
-            print(f"Request failed: {e}")
-            return ""
+            with conn.cursor() as cursor:
+                affected = cursor.executemany(sql, params_list)
+                conn.commit()
+                return affected
+        finally:
+            conn.close()
 
-    def parse(self, html_content: str) -> List[Dict[str, Any]]:
+    def query_one(self, sql: str, params: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
+        """Query a single record and return it as a dictionary."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                return cursor.fetchone()
+        finally:
+            conn.close()
+
+    def query_all(self, sql: str, params: Optional[tuple] = None) -> List[Dict[str, Any]]:
+        """Query multiple records and return them as a list of dictionaries."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                return cursor.fetchall()
+        finally:
+            conn.close()
+
+    # ========== Generic helper methods ==========
+
+    def create_table(self, table: str, columns_def: str, if_not_exists: bool = True) -> None:
+        """Dynamically create a table. columns_def is the column definition string inside parentheses."""
+        if_exists = "IF NOT EXISTS " if if_not_exists else ""
+        sql = f"CREATE TABLE {if_exists}{table} ({columns_def})"
+        self.execute(sql)
+
+    def delete_older_than(self, table: str, date_column: str, days: int) -> int:
         """
-        Parse Douban movie list page using lxml (25 items per page)
+        Generic method to delete old data.
+        :param table: Table name
+        :param date_column: Date column name (DATETIME or DATE)
+        :param days: Keep data from the last N days; delete data older than this.
+        :return: Number of rows deleted.
         """
-        tree = html.fromstring(html_content)
-        items = []
+        sql = f"DELETE FROM {table} WHERE {date_column} < NOW() - INTERVAL %s DAY"
+        return self.execute(sql, (days,))
 
-        # Each movie entry: //div[@class="item"] 
-        movie_list = tree.xpath('//div[@class="item"]')
-        for movie in movie_list:
-            # Rank: .//em text
-            rank_em = movie.xpath('.//em/text()')
-            if not rank_em:
-                continue
-            rank = int(rank_em[0].strip())
-
-            # Title: .//div[@class="hd"]/a/span[1]/text()
-            title_elem = movie.xpath('.//div[@class="hd"]/a/span[1]/text()')
-            title = title_elem[0].strip() if title_elem else ""
-
-            # Rating: .//span[@class="rating_num"]/text()
-            rating_elem = movie.xpath('.//span[@class="rating_num"]/text()')
-            rating = rating_elem[0].strip() if rating_elem else ""
-
-            # Number of ratings: find span text containing '人评价', then extract numbers
-            rating_num_elem = movie.xpath('.//div[@class="star"]/span[contains(text(), "人评价")]/text()')
-            if rating_num_elem:
-                rating_num_text = rating_num_elem[0].strip()
-                # Extract numbers (e.g., '1852462人评价' -> '1852462')
-                import re
-                match = re.search(r'(\d+)', rating_num_text)
-                rating_num = match.group(1) if match else rating_num_text
-            else:
-                rating_num = ""
-
-            # Year: extract from the first text of .bd p (usually contains year)
-            year = ""
-            info_para = movie.xpath('.//div[@class="bd"]/p[1]/text()')
-            if info_para:
-                info_text = "".join(info_para).strip()
-                import re
-                year_match = re.search(r'(\d{4})', info_text)
-                year = year_match.group(1) if year_match else ""
-
-            # Detail page URL
-            url_elem = movie.xpath('.//div[@class="hd"]/a/@href')
-            url = url_elem[0] if url_elem else ""
-
-            items.append({
-                'rank': rank,
-                'title': title,
-                'rating': rating,
-                'rating_num': rating_num,
-                'year': year,
-                'url': url
-            })
-
-        return items
-
-    def save(self, data_list: List[Dict[str, Any]]) -> int:
-        """Batch save movie data to database"""
+    def insert_batch_generic(self, table: str, data_list: List[Dict[str, Any]], extra_columns: dict = None) -> int:
+        """
+        Generic batch insert.
+        :param table: Table name
+        :param data_list: List of dictionaries; each dictionary's keys are column names and values are the values to insert.
+        :param extra_columns: Additional fixed column values, e.g., {'crawl_time': 'NOW()'}, added to each record.
+        :return: Number of rows inserted.
+        """
         if not data_list:
             return 0
 
-        # Note: rank must be backtick-quoted
-        sql = f"""
-            INSERT INTO {self.TABLE_NAME} 
-            (`rank`, title, rating, rating_num, year, url) 
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """
-        values = [
-            (
-                item['rank'],
-                item['title'],
-                item['rating'],
-                item['rating_num'],
-                item['year'],
-                item['url']
-            )
-            for item in data_list
-        ]
-        return self.db.executemany(sql, values)
+        # Merge extra columns
+        for item in data_list:
+            if extra_columns:
+                for k, v in extra_columns.items():
+                    if k not in item:
+                        item[k] = v
 
-    def run(self, top_n: int = 100) -> None:
-        """
-        Crawl Douban Movie Top 250, only save top_n items (default 100), overwrite mode
-        """
-        # 1. Clear table (overwrite, keep only data from this crawl)
-        truncate_sql = f"TRUNCATE TABLE {self.TABLE_NAME}"
-        self.db.execute(truncate_sql)
-        print(f"Cleared table {self.TABLE_NAME}, ready to store latest data.")
+        columns = list(data_list[0].keys())
+        placeholders = ', '.join(['%s'] * len(columns))
+        columns_str = ', '.join(columns)
+        sql = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
 
-        all_movies = []
-        base_url = 'https://movie.douban.com/top250'
-
-        print(f"Starting to crawl Douban Movie Top 250, target to save {top_n} items...")
-
-        for start in range(0, top_n, 25):
-            url = f'{base_url}?start={start}&filter='
-            html = self.fetch_page(url)
-            if not html:
-                print(f"Failed to get page {start//25 + 1}, stopping")
-                break
-
-            movies = self.parse(html)
-            if not movies:
-                print(f"No data on page {start//25 + 1}, stopping")
-                break
-
-            all_movies.extend(movies)
-            print(f"Fetched {len(all_movies)} movies")
-            if len(all_movies) >= top_n:
-                break
-
-        top_data = all_movies[:top_n]
-        if not top_data:
-            print("No data fetched")
-            return
-
-        inserted = self.save(top_data)
-        print(f"Successfully saved {inserted} movies (table data cleared, now latest {inserted} items)")
+        values = [tuple(item[col] for col in columns) for item in data_list]
+        return self.executemany(sql, values)
